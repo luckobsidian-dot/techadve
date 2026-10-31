@@ -1,0 +1,20 @@
+extends Node
+# REAL "YOUR SHOP IS FULL" NOTIFICATION (Kyoz "Local Notification" plugin).
+# Steps: see SETUP_NOTIFICATIONS.txt. Only AFTER you installed the plugin:
+#   rename this file to  notify_bridge.gd   (remove the .txt)
+# The plugin adds an autoload called LocalNotification.
+#
+# Function names can differ between plugin versions - check the plugin README.
+
+const TAG := 1   # same tag = the new reminder replaces the old one
+
+func _ready() -> void:
+	# Android 13+ and iOS ask the player for permission here. Later you may want
+	# to move this to the first time the player has earned some offline coins.
+	LocalNotification.request_permission()
+
+func schedule(delay_seconds: int, title: String, body: String) -> void:
+	LocalNotification.show(title, body, delay_seconds, TAG)
+
+func cancel() -> void:
+	LocalNotification.cancel(TAG)

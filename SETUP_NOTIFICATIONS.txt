@@ -1,0 +1,24 @@
+OPTIONAL: "Your shop is full!" notification
+==========================================
+
+You don't need this. The game works fully without it - the notification simply
+does nothing until you add a plugin. Skip it if it sounds like too much work.
+
+What it does: when the player leaves, a notification is scheduled for the
+moment the 2-hour offline cap is reached; coming back cancels it. A
+"Notifications" switch in Settings turns it off.
+
+1. Download the "Local Notification" plugin by Kyoz (github.com/kyoz/
+   godot-local-notification) - the zip that matches your Godot version.
+2. Android: extract it to  your_project/android/plugins  and enable it in the
+   Android export preset (Project > Install Android Build Template first, then
+   tick "Use Gradle Build" and the plugin).
+   iOS: extract to  ios/plugins  and enable it in the iOS export preset.
+3. Rename  scripts/notify_bridge.gd.txt  ->  scripts/notify_bridge.gd
+4. Export to a phone, earn some coins, leave the app. Phones may deliver it a
+   few seconds late. To test fast, temporarily set OFFLINE_MAX_SECONDS to 120
+   in main.gd.
+
+If Godot shows an error in notify_bridge.gd, the plugin's function names
+changed - match them to the plugin's README. Only that small file ever needs
+touching.
