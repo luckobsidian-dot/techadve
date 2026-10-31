@@ -34,11 +34,11 @@ const SCREEN_BASE := Vector2(84, 590)
 const WORKER_HOME_BASE := Vector2(262, 410)
 const WORKER_HOME2_BASE := Vector2(304, 462)
 const WORKER2_GEM_COST := 20   # gems to hire the second worker (Store)
-const COUNTER_BASE := Vector2(390, 262)
+const COUNTER_BASE := Vector2(390, 282)
 const ENTRANCE_BASE := Vector2(500, 690)
 const EXIT_BASE := Vector2(500, 690)
-const QUEUE_ORIGIN_BASE := Vector2(408, 492)
-const FRONT_BASE := Vector2(408, 402)
+const QUEUE_ORIGIN_BASE := Vector2(408, 512)
+const FRONT_BASE := Vector2(408, 422)
 const WORKER_BOX_BASE := Vector2(250, 360)
 const ROOM_TOP := 110.0       # top of the shop room (base numbers)
 const ROOM_BOTTOM := 850.0    # bottom of the shop room (base numbers)
@@ -101,8 +101,10 @@ const WORLDS := [
 		"words": ["case", "motherboard", "screen"],
 		"what": ["case", "case & motherboard", "full phone"],
 		"unlock": [25, 5000, 35000],
-		"base": [1, 5, 20],
-		"gain": [1, 3, 8],
+		"base": [2, 5, 20],
+		"gain": [2, 3, 8],
+		"gain_extra": [1, 0, 0],   # every 3rd level pays this much extra (Case Maker: +2, +2, +3, ...)
+		"gain_every": [3, 3, 3],
 		"bonus": [4, 8, 20],
 		"lvl_cost": [8.0, 400.0, 3000.0],
 		"lvl_grow": [1.22, 1.25, 1.25],
@@ -119,6 +121,8 @@ const WORLDS := [
 		"unlock": [25, 250000, 1000000, 4000000, 15000000],
 		"base": [8, 50, 200, 600, 1600],
 		"gain": [8, 30, 80, 240, 640],
+		"gain_extra": [0, 0, 0, 0, 0],
+		"gain_every": [3, 3, 3, 3, 3],
 		"bonus": [40, 80, 200, 600, 1600],
 		"lvl_cost": [50.0, 4000.0, 30000.0, 120000.0, 400000.0],
 		"lvl_grow": [1.23, 1.26, 1.26, 1.26, 1.26],
@@ -187,7 +191,7 @@ var faster_mb_bought := false
 var faster_screen_bought := false
 var levels: Array = [0, 0, 0, 0, 0]                          # level of each product bench in the current world
 var unlocked: Array = [false, false, false, false, false]    # bench 0 (Case Maker) uses station_open instead
-var profits: Array = [1, 5, 20, 0, 0]                        # coins each part earns right now
+var profits: Array = [2, 5, 20, 0, 0]                        # coins each part earns right now
 var crafts: Array = [3.0, 6.0, 10.0, 12.0, 15.0]             # seconds each part takes right now
 var world := 0                                               # 0 = Zokia factory, 1 = Zamzung
 var world_states: Array = [{}, {}]                           # saved shop of each world (the live one is in the vars above)
@@ -247,10 +251,7 @@ var tz_bias := 0                 # seconds between UTC and the phone's local tim
 var workers: Array = []       # worker 0 is the first; worker 1 is hired in the Store
 var worker2_hired := false
 # Workers share one order at a time: the front customer's parts are split between them.
-var order_todo: Array = []
-var order_total := 0
-var order_delivered: Array = []
-var order_active := false
+var orders: Array = []        # one entry per customer being served: {id, todo, total, delivered}
 
 func _ready() -> void:
 	font = ThemeDB.fallback_font
@@ -354,6 +355,7 @@ func _make_worker(i: int, mode: String) -> Dictionary:
 		"mode": mode,
 		"timer": 0.0,
 		"product": 0,
+		"order": -1,
 		"carried": []
 	}
 
@@ -365,10 +367,7 @@ func _reset_runtime_state() -> void:
 	workers.append(_make_worker(0, "idle" if worker_open else "boxed"))
 	if worker2_hired and worker_open:
 		workers.append(_make_worker(1, "idle"))
-	order_todo.clear()
-	order_delivered.clear()
-	order_total = 0
-	order_active = false
+	orders.clear()
 
 func _process(delta: float) -> void:
 	delta = minf(delta, 0.1)
@@ -418,10 +417,18 @@ func _ease_back(t: float) -> float:
 	var u := t - 1.0
 	return 1.0 + 2.70158 * u * u * u + 1.70158 * u * u
 
+# Serving spots at the counter: one per worker (the 2nd worker serves the 2nd customer).
+func _slots() -> int:
+	return clampi(workers.size(), 1, 2)
+
+func _slot_spot(i: int) -> Vector2:
+	return FRONT_SPOT + Vector2(66.0 * i, 0.0)
+
 func _queue_target(i: int) -> Vector2:
-	if i == 0:
-		return FRONT_SPOT
-	return QUEUE_BASE + Vector2(0, minf((i - 1) * 60.0, 120.0))
+	var n := _slots()
+	if i < n:
+		return _slot_spot(i)
+	return QUEUE_BASE + Vector2(0, minf((i - n) * 60.0, 120.0))
 
 func _update_customers(delta: float) -> void:
 	if customers.size() < max_customers:
@@ -448,15 +455,33 @@ func _update_leaving(delta: float) -> void:
 		if p.distance_to(EXIT_POS) < 2.0:
 			leaving.remove_at(i)
 
-func _front_qty() -> int:
-	if customers.is_empty():
+func _customer_qty(i: int) -> int:
+	if i < 0 or i >= customers.size():
 		return 1
-	return int(customers[0].get("qty", 1))
+	return int(customers[i].get("qty", 1))
 
-func _front_customer_ready() -> bool:
-	if customers.is_empty():
+func _customer_ready(i: int) -> bool:
+	if i < 0 or i >= customers.size() or i >= _slots():
 		return false
-	return (customers[0]["position"] as Vector2).distance_to(FRONT_SPOT) < 3.0
+	return (customers[i]["position"] as Vector2).distance_to(_slot_spot(i)) < 3.0
+
+func _customer_index(id: int) -> int:
+	for i in range(customers.size()):
+		if int(customers[i]["id"]) == id:
+			return i
+	return -1
+
+func _order_index(id: int) -> int:
+	for i in range(orders.size()):
+		if int(orders[i]["id"]) == id:
+			return i
+	return -1
+
+func _next_order_with_todo() -> int:
+	for i in range(orders.size()):
+		if not (orders[i]["todo"] as Array).is_empty():
+			return i
+	return -1
 
 func _unlocked(product: int) -> bool:
 	if product == 0:
@@ -486,20 +511,23 @@ func _craft(product: int) -> float:
 	return float(crafts[product])
 
 func _update_workers(delta: float) -> void:
-	# A new order starts once a customer is waiting at the counter.
-	# Every order needs every part you've unlocked, once per item the customer asked for.
-	if not order_active and _front_customer_ready():
-		order_todo.clear()
-		for _i in range(_front_qty()):
-			order_todo.append_array(_unlocked_products())
-		order_total = order_todo.size()
-		order_delivered.clear()
-		order_active = order_total > 0
+	# Every customer standing at a serving spot gets an order. An order needs every part you've
+	# unlocked, once per item the customer asked for. A free worker takes the next part of the
+	# first order that still has parts waiting, so the 2nd worker goes to the 2nd customer as
+	# soon as every part of the 1st customer's order is taken.
+	for i in range(mini(customers.size(), _slots())):
+		var cid := int(customers[i]["id"])
+		if _customer_ready(i) and _order_index(cid) < 0:
+			var todo: Array = []
+			for _k in range(_customer_qty(i)):
+				todo.append_array(_unlocked_products())
+			if not todo.is_empty():
+				orders.append({"id": cid, "todo": todo, "total": todo.size(), "delivered": []})
 	for i in range(workers.size()):
 		_update_worker(i, delta)
-	if order_active and order_delivered.size() >= order_total:
-		order_active = false
-		_complete_sale()
+	for k in range(orders.size() - 1, -1, -1):
+		if (orders[k]["delivered"] as Array).size() >= int(orders[k]["total"]):
+			_complete_sale(k)
 
 func _update_worker(i: int, delta: float) -> void:
 	var w: Dictionary = workers[i]
@@ -507,8 +535,10 @@ func _update_worker(i: int, delta: float) -> void:
 	var pos: Vector2 = w["position"]
 	var product: int = int(w["product"])
 	if mode == "idle":
-		if order_active and not order_todo.is_empty():
-			w["product"] = int(order_todo.pop_front())
+		var oi := _next_order_with_todo()
+		if oi >= 0:
+			w["order"] = int(orders[oi]["id"])
+			w["product"] = int((orders[oi]["todo"] as Array).pop_front())
 			w["mode"] = "to_station"
 	elif mode == "to_station":
 		var spot := _station_spot(product, i)
@@ -521,17 +551,21 @@ func _update_worker(i: int, delta: float) -> void:
 		if float(w["timer"]) <= 0.0:
 			var carried: Array = w["carried"]
 			carried.append(product)
-			if order_todo.is_empty():
-				w["mode"] = "to_counter"
-			else:
-				w["product"] = int(order_todo.pop_front())
+			var oi := _order_index(int(w["order"]))
+			if oi >= 0 and not (orders[oi]["todo"] as Array).is_empty():
+				w["product"] = int((orders[oi]["todo"] as Array).pop_front())
 				w["mode"] = "to_station"
+			else:
+				w["mode"] = "to_counter"
 	elif mode == "to_counter":
 		var dest := _deliver_spot(i)
 		w["position"] = pos.move_toward(dest, worker_move_speed * delta)
 		if (w["position"] as Vector2).distance_to(dest) < 2.0:
-			order_delivered.append_array(w["carried"])
+			var oi := _order_index(int(w["order"]))
+			if oi >= 0:
+				(orders[oi]["delivered"] as Array).append_array(w["carried"])
 			w["carried"] = []
+			w["order"] = -1
 			w["mode"] = "returning"
 	elif mode == "returning":
 		var home := _worker_home(i)
@@ -539,23 +573,27 @@ func _update_worker(i: int, delta: float) -> void:
 		if (w["position"] as Vector2).distance_to(home) < 2.0:
 			w["mode"] = "idle"
 
-func _complete_sale() -> void:
-	var qty := _front_qty()
+func _complete_sale(oi: int) -> void:
+	var o: Dictionary = orders[oi]
+	orders.remove_at(oi)
+	var ci := _customer_index(int(o["id"]))
+	var qty := _customer_qty(ci)
+	var delivered: Array = o["delivered"]
 	var earned := 0
-	for p in order_delivered:
+	for p in delivered:
 		earned += _profit(int(p))
 	if earned == 0:
 		earned = _order_total() * qty
-	if customers.size() > 0:
+	if ci >= 0:
 		# Customer walks out of the shop happily instead of vanishing.
-		leaving.append(customers[0])
-		customers.remove_at(0)
+		leaving.append(customers[ci])
+		customers.remove_at(ci)
 	coins += earned
 	total_earned += earned
 	stat_served += 1
 	_count("served", 1)
 	_count("earned", _quest_coins(earned))
-	_count("parts", order_delivered.size())
+	_count("parts", delivered.size())
 	if qty > 1:
 		stat_doubles += 1
 		_count("doubles", 1)
@@ -713,7 +751,10 @@ func _shop_rates() -> Vector2:
 	for q in range(1, 3):
 		var chance := DOUBLE_ORDER_CHANCE if q == 2 else 1.0 - DOUBLE_ORDER_CHANCE
 		revenue += chance * _order_total() * q
-		seconds += chance * maxf(_order_seconds(q, n) + maxf(back, wait), SPAWN_INTERVAL)
+		var order_t: float = _order_seconds(q, n)
+		if n >= 2 and max_customers >= 2:
+			order_t = _order_seconds(q, 1) / float(n)   # each worker takes their own customer
+		seconds += chance * maxf(order_t + maxf(back, wait), SPAWN_INTERVAL)
 	return Vector2(revenue / seconds, 1.0 / seconds)
 
 func _offline_income_per_second() -> float:
@@ -897,7 +938,7 @@ func hire_worker2() -> void:
 	workers.append(_make_worker(1, "idle"))
 	_sfx("buy")
 	_vibe(40)
-	show_toast("New worker hired! They share every order.")
+	show_toast("New worker hired! They serve the next customer.")
 	save_game()
 
 func claim_double() -> void:
@@ -1100,8 +1141,27 @@ func _level_cost(product: int) -> int:
 	var grow: Array = WORLDS[world]["lvl_grow"]
 	return int(round(float(base[product]) * pow(float(grow[product]), float(levels[product]))))
 
+# What reaching level `lvl` adds to a part's pay (the normal gain, plus the extra on every Nth level).
+func _gain_at(product: int, lvl: int) -> int:
+	var d: Dictionary = WORLDS[world]
+	var g: int = int((d["gain"] as Array)[product])
+	var extra: int = int((d["gain_extra"] as Array)[product])
+	var every: int = maxi(1, int((d["gain_every"] as Array)[product]))
+	if extra > 0 and lvl % every == 0:
+		g += extra
+	return g
+
+# Total extra pay after `n` levels.
+func _gain_total(product: int, n: int) -> int:
+	var d: Dictionary = WORLDS[world]
+	var g: int = int((d["gain"] as Array)[product])
+	var extra: int = int((d["gain_extra"] as Array)[product])
+	var every: int = maxi(1, int((d["gain_every"] as Array)[product]))
+	return g * n + extra * floori(float(n) / float(every))
+
+# Shown as "Next level: +N coins".
 func _level_gain(product: int) -> int:
-	return int((WORLDS[world]["gain"] as Array)[product])
+	return _gain_at(product, int(levels[product]) + 1)
 
 func _unlock_cost(product: int) -> int:
 	return int((WORLDS[world]["unlock"] as Array)[product])
@@ -1145,7 +1205,6 @@ func _product_upgrade_affordable(product: int) -> bool:
 func _recalc_stats() -> void:
 	var d: Dictionary = WORLDS[world]
 	var base: Array = d["base"]
-	var gain: Array = d["gain"]
 	var bonus: Array = d["bonus"]
 	var norm: Array = d["craft"]
 	var fast: Array = d["craft_fast"]
@@ -1154,7 +1213,7 @@ func _recalc_stats() -> void:
 	profits = []
 	crafts = []
 	for p in range(base.size()):
-		var pay: int = int(base[p]) + int(gain[p]) * int(levels[p])
+		var pay: int = int(base[p]) + _gain_total(p, int(levels[p]))
 		if money_bought:
 			pay += int(bonus[p])
 		profits.append(pay)
@@ -1288,7 +1347,7 @@ func _w0_unlocked(p: int) -> bool:
 	var list: Array = _unlocked_from(sv.get("unlocked", []))
 	return bool(list[p])
 
-# The "techadvv" gate: every bench at level 23 and every upgrade owned in Zokia factory.
+# The "Tech Adventure" gate: every bench at level 23 and every upgrade owned in Zokia factory.
 # Each entry is [label, have, goal].
 func _world_requirements() -> Array:
 	var sv: Dictionary = _w0_state()
@@ -1822,23 +1881,26 @@ func _draw_counter() -> void:
 	draw_circle(COUNTER_POS + Vector2(88, 22), 15, Color("f2c3a0"))
 	draw_circle(COUNTER_POS + Vector2(88, 17), 17, Color("915836"))
 	draw_rect(Rect2(COUNTER_POS.x + 75, COUNTER_POS.y + 36, 26, 26), Color("384f80"))
-	# price bubble (only once a customer is waiting)
-	if _front_customer_ready():
+	# price bubbles (one per customer waiting at a serving spot, stacked above the counter)
+	for slot in range(_slots()):
+		if not _customer_ready(slot):
+			continue
 		var items := _unlocked_products()
-		var qty := _front_qty()
+		var qty := _customer_qty(slot)
+		var oy := -42.0 * slot
 		var price_txt := "%d" % (_order_total() * qty)
 		var bw := 112.0
 		if font != null:
 			bw = maxf(112.0, 26.0 + items.size() * 22.0 + font.get_string_size(price_txt, HORIZONTAL_ALIGNMENT_LEFT, -1.0, 20).x)
 		var bx: float = minf(COUNTER_POS.x - 6, W - 12.0 - bw)
-		_rbox(Rect2(bx, COUNTER_POS.y - 38, bw, 36), Color.WHITE, 10, Color("d3e3f7"), 2, true)
+		_rbox(Rect2(bx, COUNTER_POS.y - 38 + oy, bw, 36), Color.WHITE, 10, Color("d3e3f7"), 2, true)
 		if qty > 1:
-			var bc := Vector2(bx + bw - 4, COUNTER_POS.y - 40)
+			var bc := Vector2(bx + bw - 4, COUNTER_POS.y - 40 + oy)
 			draw_circle(bc, 14, RED)
 			label_centered("x%d" % qty, Rect2(bc.x - 14, bc.y - 14, 28, 28), 14, Color.WHITE)
 		for k in range(items.size()):
-			_draw_item(int(items[k]), Vector2(bx + 8 + k * 22, COUNTER_POS.y - 27), 18.0, 14.0)
-		label(price_txt, Vector2(bx + 14 + items.size() * 22, COUNTER_POS.y - 11), 20, Color("e0a400"))
+			_draw_item(int(items[k]), Vector2(bx + 8 + k * 22, COUNTER_POS.y - 27 + oy), 18.0, 14.0)
+		label(price_txt, Vector2(bx + 14 + items.size() * 22, COUNTER_POS.y - 11 + oy), 20, Color("e0a400"))
 
 func _draw_shadow(p: Vector2, y_off: float = 34.0) -> void:
 	_xf(p + Vector2(0, y_off), Vector2(1.0, 0.3))
@@ -2081,7 +2143,7 @@ func _draw_world_menu() -> void:
 		label(str(WORLDS[i]["name"]), Vector2(row.position.x + 68, row.position.y + 30), 20, DARK)
 		var sub: String = "Phones for everyone"
 		if i == 1:
-			sub = "More items, bigger money" if zamzung_open else "Locked - see techadvv below"
+			sub = "More items, bigger money" if zamzung_open else "Locked - see below"
 		label(sub, Vector2(row.position.x + 68, row.position.y + 54), 13, grey_txt)
 		if world == i:
 			_button(btn, "Here", GREY, Color.WHITE, 20)
@@ -2099,7 +2161,7 @@ func _draw_world_menu() -> void:
 		label_centered("but has 5 items per phone and much bigger", Rect2(45, 526, 450, 22), 15, grey_txt)
 		label_centered("coins and costs. Gems and quests are shared.", Rect2(45, 548, 450, 22), 15, grey_txt)
 		return
-	label_centered("techadvv", Rect2(45, 446, 450, 28), 24, Color("2b6ff2"))
+	label_centered("Tech Adventure", Rect2(45, 446, 450, 28), 24, Color("2b6ff2"))
 	label_centered("Level %d everything + %s coins in Zokia factory" % [WORLD_ENTRY_LEVEL, _fmt_coins(WORLD_ENTRY_COINS)], Rect2(45, 474, 450, 22), 15, grey_txt)
 	var reqs: Array = _world_requirements()
 	for k in range(reqs.size()):
@@ -2367,7 +2429,7 @@ func _draw_store_menu() -> void:
 	draw_circle(c + Vector2(0, -10), 10, Color("8a4b2a"))
 	draw_circle(c + Vector2(0, -8), 8, Color("f1c39f"))
 	label("Extra Worker", Vector2(row.position.x + 68, row.position.y + 28), 18, DARK)
-	label("Two workers share every order", Vector2(row.position.x + 68, row.position.y + 52), 13, Color("74879b"))
+	label("Serves the next customer", Vector2(row.position.x + 68, row.position.y + 52), 13, Color("74879b"))
 	if worker2_hired:
 		_button(btn, "Hired", Color("c9d3e0"), Color("6c7c8f"), 18)
 	else:
